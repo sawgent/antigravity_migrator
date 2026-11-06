@@ -1,0 +1,4 @@
+# Antigravity Migrator Gereksinimleri
+# Arayüz için standart Python Tkinter kütüphanesi kullanılır (Python ile birlikte gelir).
+# Uygulamayı tek bir .exe haline getirmek için:
+pyinstaller>=6.0.0
