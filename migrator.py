@@ -1,28 +1,42 @@
 # -*- coding: utf-8 -*-
 """
-Antigravity Taşıyıcı (Antigravity Migrator) v1.1
+Antigravity Taşıyıcı (Antigravity Migrator) v1.2
 Antigravity projelerini, özel eklentilerini (plugins), becerilerini (skills),
-kurallarını (rules) ve konuşma geçmişini (brain) güvenle başka bir bilgisayara
-taşımak için tek dosyalık araç.
+kurallarını (rules), konuşma veritabanlarını (conversations & conversation_summaries.db),
+bilgi tabanını (knowledge), notları (annotations) ve artifact'ları (brain)
+güvenle başka bir bilgisayara taşımak ve mevcut veritabanlarıyla kayıpsız
+birleştirmek için tek dosyalık araç.
 """
 
 import os
 import sys
 import json
 import shutil
+import sqlite3
 import datetime
 import threading
+import subprocess
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 SYSTEM_EXCLUDE_DIRS = {
-    "bin", "builtin", "lib", "daemon", "cache", "sandbox", 
+    "bin", "builtin", "lib", "daemon", "cache", "sandbox",
     "__pycache__", ".pytest_cache"
 }
 SYSTEM_EXCLUDE_FILES = {
-    "installation_id", "conversation_summaries.db-wal", 
-    "conversation_summaries.db-shm"
+    "installation_id", "knowledge.lock",
+    "conversation_summaries.db-wal", "conversation_summaries.db-shm"
 }
+
+
+def is_excluded_file(filename):
+    low = filename.lower()
+    if low in SYSTEM_EXCLUDE_FILES:
+        return True
+    if low.endswith(".db-wal") or low.endswith(".db-shm") or low.endswith(".lock"):
+        return True
+    return False
+
 
 def format_size(size_bytes):
     if size_bytes < 1024:
@@ -34,6 +48,7 @@ def format_size(size_bytes):
     else:
         return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
 
+
 def get_dir_size(path, exclude_system=True):
     total = 0
     try:
@@ -41,7 +56,7 @@ def get_dir_size(path, exclude_system=True):
             if exclude_system:
                 dirs[:] = [d for d in dirs if d.lower() not in SYSTEM_EXCLUDE_DIRS]
             for f in files:
-                if exclude_system and f.lower() in SYSTEM_EXCLUDE_FILES:
+                if exclude_system and is_excluded_file(f):
                     continue
                 fp = os.path.join(root, f)
                 try:
@@ -52,7 +67,113 @@ def get_dir_size(path, exclude_system=True):
         pass
     return total
 
-def safe_copy_tree(src, dst, log_cb=None, progress_cb=None, exclude_system=True):
+
+def backup_sqlite_db(src_db, dst_db):
+    """
+    SQLite veritabanını WAL dosyasını da dahil ederek temiz, tutarlı bir
+    tekil .db dosyası olarak yedekler.
+    """
+    os.makedirs(os.path.dirname(dst_db), exist_ok=True)
+    if os.path.exists(dst_db):
+        try:
+            os.remove(dst_db)
+        except Exception:
+            pass
+    try:
+        src_conn = sqlite3.connect(f"file:{src_db}?mode=ro", uri=True, timeout=10.0)
+        dst_conn = sqlite3.connect(dst_db, timeout=10.0)
+        with dst_conn:
+            src_conn.backup(dst_conn)
+        dst_conn.close()
+        src_conn.close()
+    except Exception:
+        # Salt okunur URI veya kilit durumunda normal kopyalamaya düş
+        shutil.copy2(src_db, dst_db)
+
+
+def merge_conversation_summaries_db(src_db, dst_db):
+    """
+    Eski bilgisayardan gelen conversation_summaries.db ile hedef bilgisayardaki
+    mevcut conversation_summaries.db veritabanını kayıpsız birleştirir.
+    Dönüş: (eklenen_konusma_sayisi, toplam_konusma_sayisi)
+    """
+    if not os.path.exists(src_db):
+        return (0, 0)
+
+    os.makedirs(os.path.dirname(dst_db), exist_ok=True)
+
+    # Hedef veritabanı yoksa doğrudan temiz kopyala
+    if not os.path.exists(dst_db):
+        backup_sqlite_db(src_db, dst_db)
+        try:
+            conn = sqlite3.connect(dst_db, timeout=10.0)
+            total = conn.execute("SELECT COUNT(*) FROM conversation_summaries").fetchone()[0]
+            conn.close()
+            return (total, total)
+        except Exception:
+            return (0, 0)
+
+    # Mevcut veritabanı varsa önce güvenlik yedeği al
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    bak_path = f"{dst_db}.bak_{ts}"
+    backup_sqlite_db(dst_db, bak_path)
+
+    conn = sqlite3.connect(dst_db, timeout=15.0)
+    try:
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:
+            pass
+
+        conn.execute("ATTACH DATABASE ? AS src_db", (src_db,))
+
+        # 1. conversation_summaries tablosunu ortak sütunlar üzerinden birleştir
+        dst_cols = [r[1] for r in conn.execute("PRAGMA main.table_info(conversation_summaries)").fetchall()]
+        src_cols = [r[1] for r in conn.execute("PRAGMA src_db.table_info(conversation_summaries)").fetchall()]
+        common_cols = [c for c in dst_cols if c in src_cols]
+
+        added_count = 0
+        if common_cols:
+            cols_sql = ", ".join(f'"{c}"' for c in common_cols)
+            cur = conn.execute(
+                f"INSERT OR IGNORE INTO main.conversation_summaries ({cols_sql}) "
+                f"SELECT {cols_sql} FROM src_db.conversation_summaries"
+            )
+            added_count = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
+
+        # 2. conversation_parents tablosunu birleştir (varsa)
+        dst_tables = {r[0] for r in conn.execute("SELECT name FROM main.sqlite_master WHERE type='table'").fetchall()}
+        src_tables = {r[0] for r in conn.execute("SELECT name FROM src_db.sqlite_master WHERE type='table'").fetchall()}
+
+        if "conversation_parents" in dst_tables and "conversation_parents" in src_tables:
+            conn.execute(
+                "INSERT OR IGNORE INTO main.conversation_parents (conversation_id, parent_id) "
+                "SELECT conversation_id, parent_id FROM src_db.conversation_parents"
+            )
+
+        # 3. conversations_fts arama indeksini birleştir (yalnızca yeni eklenen konuşmalar için)
+        if "conversations_fts" in dst_tables and "conversations_fts" in src_tables:
+            dst_fts_cols = [r[1] for r in conn.execute("PRAGMA main.table_info(conversations_fts)").fetchall()]
+            src_fts_cols = [r[1] for r in conn.execute("PRAGMA src_db.table_info(conversations_fts)").fetchall()]
+            common_fts_cols = [c for c in dst_fts_cols if c in src_fts_cols]
+            if common_fts_cols:
+                fts_sql = ", ".join(f'"{c}"' for c in common_fts_cols)
+                conn.execute(
+                    f"INSERT INTO main.conversations_fts ({fts_sql}) "
+                    f"SELECT {fts_sql} FROM src_db.conversations_fts "
+                    f"WHERE conversation_id NOT IN (SELECT DISTINCT conversation_id FROM main.conversations_fts)"
+                )
+
+        conn.commit()
+        conn.execute("DETACH DATABASE src_db")
+
+        total_count = conn.execute("SELECT COUNT(*) FROM main.conversation_summaries").fetchone()[0]
+        return (added_count, total_count)
+    finally:
+        conn.close()
+
+
+def safe_copy_tree(src, dst, log_cb=None, progress_cb=None, exclude_system=True, skip_existing=False):
     os.makedirs(dst, exist_ok=True)
     for root, dirs, files in os.walk(src):
         if exclude_system:
@@ -62,43 +183,62 @@ def safe_copy_tree(src, dst, log_cb=None, progress_cb=None, exclude_system=True)
         os.makedirs(dest_root, exist_ok=True)
 
         for f in files:
-            if exclude_system and f.lower() in SYSTEM_EXCLUDE_FILES:
+            if exclude_system and is_excluded_file(f):
                 continue
             src_file = os.path.join(root, f)
             dest_file = os.path.join(dest_root, f)
+            if skip_existing and os.path.exists(dest_file):
+                continue
             try:
-                shutil.copy2(src_file, dest_file)
+                if f.lower().endswith(".db"):
+                    backup_sqlite_db(src_file, dest_file)
+                else:
+                    shutil.copy2(src_file, dest_file)
                 if progress_cb:
                     progress_cb()
             except Exception as e:
                 if log_cb:
                     log_cb(f"Uyarı: {f} kopyalanamadı ({e})")
 
+
+def is_antigravity_running():
+    """Windows üzerinde Antigravity uygulamasının çalışıp çalışmadığını kontrol eder."""
+    try:
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        out = subprocess.check_output(
+            ["tasklist", "/FI", "IMAGENAME eq Antigravity.exe"],
+            startupinfo=si,
+            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+            text=True,
+            errors="ignore"
+        )
+        return "antigravity.exe" in out.lower()
+    except Exception:
+        return False
+
+
 class AntigravityMigratorApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Antigravity Proje ve Veri Taşıyıcı")
-        # Ekran ölçeklendirmesi (DPI) ve butonların tam sığması için optimize edilmiş boyutlar
+        self.title("Antigravity Proje ve Veri Taşıyıcı v1.2")
         self.geometry("900x740")
         self.minsize(800, 620)
-        
+
         self._set_style()
         self._setup_context_menu()
-        
+
         # Varsayılan Konumlar
         self.default_user_home = os.path.expanduser("~")
         self.default_gemini_path = os.path.join(self.default_user_home, ".gemini")
-        self.default_scratch_path = os.path.join(self.default_gemini_path, "antigravity", "scratch")
-        self.default_config_path = os.path.join(self.default_gemini_path, "config")
-        self.default_brain_path = os.path.join(self.default_gemini_path, "antigravity", "brain")
-        
+
         # Tarama öğeleri
-        self.export_items = []  # dicts: {'id', 'name', 'type', 'group', 'path', 'size', 'var'}
+        self.export_items = []
         self.import_items = []
         self.custom_project_folders = []
 
         self._build_ui()
-        
+
         # Başlangıçta aynı dizindeki yedekleri otomatik algıla
         self.after(350, self.check_auto_detect_backup)
 
@@ -124,7 +264,6 @@ class AntigravityMigratorApp(tk.Tk):
         self.context_menu.add_separator()
         self.context_menu.add_command(label="Tümünü Seç", command=self._ctx_select_all)
 
-        # Tüm Entry ve Text alanlarına sağ tık menüsünü bağla
         self.bind_class("Entry", "<Button-3>", self._show_context_menu)
         self.bind_class("TEntry", "<Button-3>", self._show_context_menu)
         self.bind_class("Text", "<Button-3>", self._show_context_menu)
@@ -143,7 +282,7 @@ class AntigravityMigratorApp(tk.Tk):
                 state = "disabled"
         except Exception:
             pass
-        
+
         self.context_menu.entryconfigure("Kes", state=state)
         self.context_menu.entryconfigure("Yapıştır", state=state)
         self.context_menu.tk_popup(event.x_root, event.y_root)
@@ -187,20 +326,19 @@ class AntigravityMigratorApp(tk.Tk):
     # ANA ARAYÜZ (LAYOUT)
     # =========================================================================
     def _build_ui(self):
-        # Üst Başlık Banner
         header_frame = tk.Frame(self, bg="#0f172a", height=65)
         header_frame.pack(fill="x", side="top")
         header_frame.pack_propagate(False)
 
-        title_lbl = tk.Label(header_frame, text="Antigravity Taşıyıcı (Migrator)", 
+        title_lbl = tk.Label(header_frame, text="Antigravity Taşıyıcı (Migrator) v1.2",
                              font=("Segoe UI", 14, "bold"), fg="#ffffff", bg="#0f172a")
         title_lbl.pack(anchor="w", padx=20, pady=(8, 1))
-        
-        subtitle_lbl = tk.Label(header_frame, text="Projelerinizi, eklentilerinizi, kurallarınızı ve konuşma geçmişinizi güvenle taşıyın", 
+
+        subtitle_lbl = tk.Label(header_frame,
+                                text="Projelerinizi, konuşma veritabanlarınızı, eklentilerinizi ve kurallarınızı güvenle taşıyın",
                                 font=("Segoe UI", 9), fg="#94a3b8", bg="#0f172a")
         subtitle_lbl.pack(anchor="w", padx=20)
 
-        # Sekmeli Yapı
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True, padx=10, pady=8)
 
@@ -217,7 +355,6 @@ class AntigravityMigratorApp(tk.Tk):
     # DIŞA AKTAR (EXPORT) SEKMESİ
     # =========================================================================
     def _build_export_tab(self):
-        # Alt Buton & İlerleme Çubuğu (HER ZAMAN GÖRÜNSÜN DİYE ÖNCE pack(side='bottom'))
         action_frame = ttk.Frame(self.export_tab, padding=8)
         action_frame.pack(side="bottom", fill="x", padx=10, pady=(2, 6))
 
@@ -233,7 +370,6 @@ class AntigravityMigratorApp(tk.Tk):
         self.btn_start_export = ttk.Button(bot_row, text="🚀 Yedeklemeyi Başlat", style="Action.TButton", command=self.start_export)
         self.btn_start_export.pack(side="right", padx=2)
 
-        # 1. Konum Ayarları (Üstte)
         paths_group = ttk.LabelFrame(self.export_tab, text=" Kaynak ve Hedef Konumlar ", padding=8)
         paths_group.pack(side="top", fill="x", padx=10, pady=5)
 
@@ -265,21 +401,18 @@ class AntigravityMigratorApp(tk.Tk):
         btn_add_custom = ttk.Button(btn_row, text="➕ Ekstra Proje Klasörü Ekle...", command=self._add_custom_project)
         btn_add_custom.pack(side="right")
 
-        # 2. Gruplanmış Öğeler Listesi (Ortada Esnek Alan)
         items_group = ttk.LabelFrame(self.export_tab, text=" Aktarılacak Öğeler (Gruplara Göre Seçim Yapın) ", padding=6)
         items_group.pack(side="top", fill="both", expand=True, padx=10, pady=4)
 
-        # Kontrol Butonları & Özet
         sel_btn_frame = ttk.Frame(items_group)
         sel_btn_frame.pack(fill="x", pady=(0, 4))
-        
+
         ttk.Button(sel_btn_frame, text="Tümünü Seç", command=lambda: self._set_all_export(True)).pack(side="left", padx=2)
         ttk.Button(sel_btn_frame, text="Tümünü Kaldır", command=lambda: self._set_all_export(False)).pack(side="left", padx=2)
-        
+
         self.exp_summary_lbl = ttk.Label(sel_btn_frame, text="Henüz tarama yapılmadı.", font=("Segoe UI", 9, "italic"))
         self.exp_summary_lbl.pack(side="right", padx=6)
 
-        # Scrollable Canvas
         canvas_container = ttk.Frame(items_group)
         canvas_container.pack(fill="both", expand=True)
 
@@ -294,11 +427,8 @@ class AntigravityMigratorApp(tk.Tk):
 
         self.exp_canvas_window = self.exp_canvas.create_window((0, 0), window=self.exp_scroll_frame, anchor="nw")
         self.exp_canvas.configure(yscrollcommand=scrollbar.set)
-        
-        # Canvas genişlik senkronizasyonu
-        self.exp_canvas.bind('<Configure>', lambda e: self.exp_canvas.itemconfig(self.exp_canvas_window, width=e.width))
 
-        # Fare tekerleği ile kaydırma
+        self.exp_canvas.bind('<Configure>', lambda e: self.exp_canvas.itemconfig(self.exp_canvas_window, width=e.width))
         self._bind_mousewheel(self.exp_canvas, self.exp_scroll_frame)
 
         self.exp_canvas.pack(side="left", fill="both", expand=True)
@@ -351,14 +481,18 @@ class AntigravityMigratorApp(tk.Tk):
         self.export_items.clear()
 
         gemini_root = self.exp_gemini_var.get().strip()
+        agy_root = os.path.join(gemini_root, "antigravity")
         config_dir = os.path.join(gemini_root, "config")
-        scratch_dir = os.path.join(gemini_root, "antigravity", "scratch")
-        brain_dir = os.path.join(gemini_root, "antigravity", "brain")
+        scratch_dir = os.path.join(agy_root, "scratch")
+        brain_dir = os.path.join(agy_root, "brain")
+        conv_dir = os.path.join(agy_root, "conversations")
+        summaries_db = os.path.join(agy_root, "conversation_summaries.db")
+        annotations_dir = os.path.join(agy_root, "annotations")
+        knowledge_dir = os.path.join(agy_root, "knowledge")
 
         # 1. Projeler Grubu
         project_items = []
 
-        # Scratch Projects
         if os.path.exists(scratch_dir):
             try:
                 entries = sorted(os.listdir(scratch_dir))
@@ -383,7 +517,7 @@ class AntigravityMigratorApp(tk.Tk):
                         })
                     else:
                         loose_files.append(full_p)
-                
+
                 if loose_files:
                     total_loose_size = sum(os.path.getsize(f) for f in loose_files if os.path.isfile(f))
                     var = tk.BooleanVar(value=True)
@@ -401,7 +535,6 @@ class AntigravityMigratorApp(tk.Tk):
             except Exception as e:
                 messagebox.showerror("Hata", f"Scratch klasörü taranırken hata: {e}")
 
-        # Özel Eklenen Projeler
         for cpath in self.custom_project_folders:
             if os.path.exists(cpath):
                 folder_name = os.path.basename(cpath)
@@ -419,12 +552,11 @@ class AntigravityMigratorApp(tk.Tk):
                     "var": var
                 })
 
-        # 2. Sistem & Yapılandırma Grubu (Config ve Brain)
+        # 2. Sistem & Yapılandırma Grubu
         system_items = []
 
         if os.path.exists(config_dir):
             c_size = get_dir_size(config_dir)
-            var = tk.BooleanVar(value=True)
             system_items.append({
                 "id": "config",
                 "name": "⚙️ Antigravity Yapılandırmaları",
@@ -433,22 +565,69 @@ class AntigravityMigratorApp(tk.Tk):
                 "type": "config",
                 "path": config_dir,
                 "size": c_size,
-                "var": var
+                "var": tk.BooleanVar(value=True)
+            })
+
+        # Konuşma Veritabanları (conversations/*.db + conversation_summaries.db)
+        conv_exists = os.path.exists(conv_dir)
+        sum_exists = os.path.exists(summaries_db)
+        if conv_exists or sum_exists:
+            conv_size = get_dir_size(conv_dir) if conv_exists else 0
+            sum_size = os.path.getsize(summaries_db) if sum_exists else 0
+            db_count = len([f for f in os.listdir(conv_dir) if f.lower().endswith(".db")]) if conv_exists else 0
+            system_items.append({
+                "id": "conversations_pack",
+                "name": f"💬 Konuşma Veritabanları ({db_count} konuşma)",
+                "desc": "Sohbet geçmişi (.db) ve konuşma listesi (conversation_summaries.db - İçe aktarmada birleştirilir)",
+                "group": "system",
+                "type": "conversations_pack",
+                "conv_path": conv_dir if conv_exists else "",
+                "summaries_path": summaries_db if sum_exists else "",
+                "path": agy_root,
+                "size": conv_size + sum_size,
+                "var": tk.BooleanVar(value=True)
             })
 
         if os.path.exists(brain_dir):
             b_size = get_dir_size(brain_dir)
-            var = tk.BooleanVar(value=True)
             system_items.append({
                 "id": "brain",
-                "name": "🧠 Konuşma Geçmişi ve Üretilen Dokümanlar",
+                "name": "🧠 Üretilen Dokümanlar ve Transkriptler (Brain)",
                 "desc": "Oturum transkriptleri (transcript.jsonl), planlar ve artifact dosyaları",
                 "group": "system",
                 "type": "brain",
                 "path": brain_dir,
                 "size": b_size,
-                "var": var
+                "var": tk.BooleanVar(value=True)
             })
+
+        if os.path.exists(annotations_dir):
+            a_size = get_dir_size(annotations_dir)
+            if a_size > 0:
+                system_items.append({
+                    "id": "annotations",
+                    "name": "📝 Konuşma Notları (Annotations)",
+                    "desc": "Konuşmalara eklenen kullanıcı notları ve işaretler",
+                    "group": "system",
+                    "type": "annotations",
+                    "path": annotations_dir,
+                    "size": a_size,
+                    "var": tk.BooleanVar(value=True)
+                })
+
+        if os.path.exists(knowledge_dir):
+            k_size = get_dir_size(knowledge_dir)
+            if k_size > 0:
+                system_items.append({
+                    "id": "knowledge",
+                    "name": "📚 Öğrenilmiş Bilgi Tabanı (Knowledge)",
+                    "desc": "Antigravity tarafından çıkarılmış kalıcı bilgi öğeleri",
+                    "group": "system",
+                    "type": "knowledge",
+                    "path": knowledge_dir,
+                    "size": k_size,
+                    "var": tk.BooleanVar(value=True)
+                })
 
         self.export_items = project_items + system_items
 
@@ -456,7 +635,6 @@ class AntigravityMigratorApp(tk.Tk):
             lbl = ttk.Label(self.exp_scroll_frame, text="Belirtilen yolda aktarılacak herhangi bir Antigravity verisi bulunamadı.", foreground="#dc2626")
             lbl.pack(anchor="w", padx=10, pady=10)
         else:
-            # 1. GRUP: PROJELER
             self._render_group_ui(
                 parent=self.exp_scroll_frame,
                 group_title="📁 PROJELER VE ÇALIŞMA DOSYALARI",
@@ -464,8 +642,6 @@ class AntigravityMigratorApp(tk.Tk):
                 items=project_items,
                 is_export=True
             )
-
-            # 2. GRUP: SİSTEM & YAPILANDIRMA
             self._render_group_ui(
                 parent=self.exp_scroll_frame,
                 group_title="⚙️ ANTİGRAVİTY SİSTEM & YAPILANDIRMA VERİLERİ",
@@ -483,7 +659,6 @@ class AntigravityMigratorApp(tk.Tk):
 
         total_group_size = sum(it["size"] for it in items)
 
-        # Grup Başlık Paneli (Ayrık ve belirgin görünüm)
         group_header = tk.Frame(parent, bg="#e2e8f0", bd=1, relief="solid")
         group_header.pack(fill="x", padx=4, pady=(10, 2))
 
@@ -497,14 +672,13 @@ class AntigravityMigratorApp(tk.Tk):
         btn_box.pack(side="right", padx=6)
 
         cb_cmd = lambda val: (self._set_group_export(group_id, val) if is_export else self._set_group_import(group_id, val))
-        
+
         b1 = tk.Button(btn_box, text="Tümünü Seç", font=("Segoe UI", 8), bg="#ffffff", relief="groove", command=lambda: cb_cmd(True))
         b1.pack(side="left", padx=2, pady=2)
 
         b2 = tk.Button(btn_box, text="Kaldır", font=("Segoe UI", 8), bg="#ffffff", relief="groove", command=lambda: cb_cmd(False))
         b2.pack(side="left", padx=2, pady=2)
 
-        # Grup Öğeleri
         items_card = tk.Frame(parent, bg="#ffffff", bd=1, relief="groove")
         items_card.pack(fill="x", padx=4, pady=(0, 4))
 
@@ -552,42 +726,47 @@ class AntigravityMigratorApp(tk.Tk):
         try:
             os.makedirs(dest_dir, exist_ok=True)
             manifest_items = []
-            
+
             for idx, item in enumerate(selected_items, 1):
                 self._update_status(f"Kopyalanıyor ({idx}/{len(selected_items)}): {item['name']}...")
-                
-                if item["type"] == "config":
-                    target_sub = os.path.join(dest_dir, "config")
+                itype = item["type"]
+
+                if itype in ("config", "brain", "annotations", "knowledge"):
+                    target_sub = os.path.join(dest_dir, itype)
                     safe_copy_tree(item["path"], target_sub)
                     manifest_items.append({
                         "id": item["id"],
-                        "type": item["type"],
+                        "type": itype,
                         "group": "system",
                         "name": item["name"],
                         "desc": item.get("desc", ""),
-                        "rel_path": "config",
+                        "rel_path": itype,
                         "size": item["size"]
                     })
-                    
-                elif item["type"] == "brain":
-                    target_sub = os.path.join(dest_dir, "brain")
-                    safe_copy_tree(item["path"], target_sub)
+
+                elif itype == "conversations_pack":
+                    pack_dir = os.path.join(dest_dir, "conversations_data")
+                    os.makedirs(pack_dir, exist_ok=True)
+                    if item.get("conv_path") and os.path.exists(item["conv_path"]):
+                        safe_copy_tree(item["conv_path"], os.path.join(pack_dir, "conversations"))
+                    if item.get("summaries_path") and os.path.exists(item["summaries_path"]):
+                        backup_sqlite_db(item["summaries_path"], os.path.join(pack_dir, "conversation_summaries.db"))
                     manifest_items.append({
                         "id": item["id"],
-                        "type": item["type"],
+                        "type": "conversations_pack",
                         "group": "system",
                         "name": item["name"],
                         "desc": item.get("desc", ""),
-                        "rel_path": "brain",
+                        "rel_path": "conversations_data",
                         "size": item["size"]
                     })
-                    
-                elif item["type"] == "scratch_project":
+
+                elif itype == "scratch_project":
                     target_sub = os.path.join(dest_dir, "projects", item["folder_name"])
                     safe_copy_tree(item["path"], target_sub)
                     manifest_items.append({
                         "id": item["id"],
-                        "type": item["type"],
+                        "type": itype,
                         "group": "projects",
                         "folder_name": item["folder_name"],
                         "name": item["name"],
@@ -596,12 +775,12 @@ class AntigravityMigratorApp(tk.Tk):
                         "size": item["size"]
                     })
 
-                elif item["type"] == "custom_project":
+                elif itype == "custom_project":
                     target_sub = os.path.join(dest_dir, "custom_projects", item["folder_name"])
                     safe_copy_tree(item["path"], target_sub)
                     manifest_items.append({
                         "id": item["id"],
-                        "type": item["type"],
+                        "type": itype,
                         "group": "projects",
                         "folder_name": item["folder_name"],
                         "name": item["name"],
@@ -610,7 +789,7 @@ class AntigravityMigratorApp(tk.Tk):
                         "size": item["size"]
                     })
 
-                elif item["type"] == "scratch_loose_files":
+                elif itype == "scratch_loose_files":
                     target_sub = os.path.join(dest_dir, "scratch_files")
                     os.makedirs(target_sub, exist_ok=True)
                     for fpath in item["files"]:
@@ -618,7 +797,7 @@ class AntigravityMigratorApp(tk.Tk):
                             shutil.copy2(fpath, os.path.join(target_sub, os.path.basename(fpath)))
                     manifest_items.append({
                         "id": item["id"],
-                        "type": item["type"],
+                        "type": itype,
                         "group": "projects",
                         "name": item["name"],
                         "desc": item.get("desc", ""),
@@ -626,9 +805,8 @@ class AntigravityMigratorApp(tk.Tk):
                         "size": item["size"]
                     })
 
-            # Manifest oluştur
             manifest = {
-                "manifest_version": "1.1",
+                "manifest_version": "1.2",
                 "tool": "Antigravity Migrator",
                 "created_at": datetime.datetime.now().isoformat(),
                 "created_by_user": os.getenv("USERNAME", "unknown"),
@@ -638,13 +816,13 @@ class AntigravityMigratorApp(tk.Tk):
             with open(manifest_file, "w", encoding="utf-8") as f:
                 json.dump(manifest, f, ensure_ascii=False, indent=2)
 
-            # KENDİ KOPYASINI YEDEK KLASÖRÜNE KOY
             self._update_status("Uygulamanın bir kopyası yedek klasörüne ekleniyor...")
             self_exe_path = sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__)
             dest_exe_name = "AntigravityMigrator.exe" if self_exe_path.lower().endswith(".exe") else "AntigravityMigrator.py"
             dest_self_path = os.path.join(dest_dir, dest_exe_name)
             try:
-                shutil.copy2(self_exe_path, dest_self_path)
+                if os.path.abspath(self_exe_path) != os.path.abspath(dest_self_path):
+                    shutil.copy2(self_exe_path, dest_self_path)
             except Exception:
                 pass
 
@@ -661,7 +839,7 @@ class AntigravityMigratorApp(tk.Tk):
         self.exp_progress.config(mode="determinate", value=100)
         self.btn_start_export.config(state="normal")
         self.exp_status_lbl.config(text="✅ Yedekleme başarıyla tamamlandı!")
-        
+
         msg = (
             f"Tebrikler! Seçilen {count} öğe başarıyla yedeklendi.\n\n"
             f"Hedef Klasör:\n{dest_dir}\n\n"
@@ -685,7 +863,6 @@ class AntigravityMigratorApp(tk.Tk):
     # İÇE AKTAR (IMPORT / GERİ YÜKLE) SEKMESİ
     # =========================================================================
     def _build_import_tab(self):
-        # Alt Buton & İlerleme Çubuğu (Önce pack(side='bottom'))
         action_frame = ttk.Frame(self.import_tab, padding=8)
         action_frame.pack(side="bottom", fill="x", padx=10, pady=(2, 6))
 
@@ -701,7 +878,6 @@ class AntigravityMigratorApp(tk.Tk):
         self.btn_start_import = ttk.Button(bot_row, text="📥 İçe Aktarmayı Başlat", style="Action.TButton", command=self.start_import)
         self.btn_start_import.pack(side="right", padx=2)
 
-        # 1. Konum Ayarları (Üstte)
         paths_group = ttk.LabelFrame(self.import_tab, text=" Kaynak Yedek ve Hedef Konumlar ", padding=8)
         paths_group.pack(side="top", fill="x", padx=10, pady=5)
 
@@ -726,16 +902,15 @@ class AntigravityMigratorApp(tk.Tk):
         btn_scan = ttk.Button(paths_group, text="🔍 Yedek İçeriğini İncele / Tara", command=self.scan_import_items)
         btn_scan.grid(row=2, column=1, sticky="w", pady=(6, 2))
 
-        # 2. Gruplanmış Öğeler Listesi
         items_group = ttk.LabelFrame(self.import_tab, text=" İçe Aktarılacak Öğeler (Gruplara Göre Seçim Yapın) ", padding=6)
         items_group.pack(side="top", fill="both", expand=True, padx=10, pady=4)
 
         sel_btn_frame = ttk.Frame(items_group)
         sel_btn_frame.pack(fill="x", pady=(0, 4))
-        
+
         ttk.Button(sel_btn_frame, text="Tümünü Seç", command=lambda: self._set_all_import(True)).pack(side="left", padx=2)
         ttk.Button(sel_btn_frame, text="Tümünü Kaldır", command=lambda: self._set_all_import(False)).pack(side="left", padx=2)
-        
+
         self.imp_summary_lbl = ttk.Label(sel_btn_frame, text="Yedek klasörü seçip tarama yapın.", font=("Segoe UI", 9, "italic"))
         self.imp_summary_lbl.pack(side="right", padx=6)
 
@@ -753,7 +928,7 @@ class AntigravityMigratorApp(tk.Tk):
 
         self.imp_canvas_window = self.imp_canvas.create_window((0, 0), window=self.imp_scroll_frame, anchor="nw")
         self.imp_canvas.configure(yscrollcommand=scrollbar.set)
-        
+
         self.imp_canvas.bind('<Configure>', lambda e: self.imp_canvas.itemconfig(self.imp_canvas_window, width=e.width))
         self._bind_mousewheel(self.imp_canvas, self.imp_scroll_frame)
 
@@ -815,8 +990,8 @@ class AntigravityMigratorApp(tk.Tk):
                         var = tk.BooleanVar(value=True)
                         group = it.get("group")
                         if not group:
-                            group = "system" if it.get("type") in ("config", "brain") else "projects"
-                        
+                            group = "system" if it.get("type") in ("config", "brain", "conversations_pack", "annotations", "knowledge") else "projects"
+
                         item_obj = {
                             "id": it.get("id"),
                             "name": it.get("name", os.path.basename(it_path)),
@@ -844,13 +1019,16 @@ class AntigravityMigratorApp(tk.Tk):
                 if os.path.isdir(full_p):
                     sz = get_dir_size(full_p)
                     var = tk.BooleanVar(value=True)
-                    group = "system" if entry.lower() in ("config", "brain") else "projects"
+                    low = entry.lower()
+                    sys_types = ("config", "brain", "conversations_data", "annotations", "knowledge")
+                    group = "system" if low in sys_types else "projects"
+                    itype = "conversations_pack" if low == "conversations_data" else (low if low in sys_types else "scratch_project")
                     item_obj = {
                         "id": entry,
                         "name": f"📁 {entry}",
                         "desc": "Yedek Klasörü",
                         "group": group,
-                        "type": entry.lower() if entry.lower() in ("config", "brain") else "scratch_project",
+                        "type": itype,
                         "folder_name": entry,
                         "rel_path": entry,
                         "full_path": full_p,
@@ -897,6 +1075,17 @@ class AntigravityMigratorApp(tk.Tk):
             messagebox.showwarning("Hedef Eksik", "Lütfen Antigravity (.gemini) hedef konumunu belirtin!")
             return
 
+        has_conv = any(i.get("type") == "conversations_pack" for i in selected_items)
+        if has_conv and is_antigravity_running():
+            ans = messagebox.askyesno(
+                "Antigravity Açık Görünüyor",
+                "Konuşma veritabanlarını (conversations / conversation_summaries.db) güvenle birleştirebilmek için "
+                "Antigravity uygulamasının kapalı olması gerekir.\n\n"
+                "Lütfen Antigravity'yi kapatıp devam edin. Yine de devam etmek istiyor musunuz?"
+            )
+            if not ans:
+                return
+
         self.btn_start_import.config(state="disabled")
         self.imp_progress.config(mode="indeterminate")
         self.imp_progress.start(10)
@@ -906,9 +1095,16 @@ class AntigravityMigratorApp(tk.Tk):
 
     def _run_import_thread(self, selected_items, dest_gemini):
         try:
-            target_scratch = os.path.join(dest_gemini, "antigravity", "scratch")
-            target_brain = os.path.join(dest_gemini, "antigravity", "brain")
+            agy_dest = os.path.join(dest_gemini, "antigravity")
+            target_scratch = os.path.join(agy_dest, "scratch")
+            target_brain = os.path.join(agy_dest, "brain")
             target_config = os.path.join(dest_gemini, "config")
+            target_conv = os.path.join(agy_dest, "conversations")
+            target_summaries_db = os.path.join(agy_dest, "conversation_summaries.db")
+            target_annotations = os.path.join(agy_dest, "annotations")
+            target_knowledge = os.path.join(agy_dest, "knowledge")
+
+            merge_info = None
 
             for idx, item in enumerate(selected_items, 1):
                 self._update_imp_status(f"Aktarılıyor ({idx}/{len(selected_items)}): {item['name']}...")
@@ -918,6 +1114,19 @@ class AntigravityMigratorApp(tk.Tk):
                     safe_copy_tree(item["full_path"], target_config)
                 elif itype == "brain":
                     safe_copy_tree(item["full_path"], target_brain)
+                elif itype == "annotations":
+                    safe_copy_tree(item["full_path"], target_annotations)
+                elif itype == "knowledge":
+                    safe_copy_tree(item["full_path"], target_knowledge)
+                elif itype == "conversations_pack":
+                    src_conv_dir = os.path.join(item["full_path"], "conversations")
+                    if os.path.exists(src_conv_dir):
+                        # Mevcut konuşmaları ezmeden sadece eksik olanları / yeni .db dosyalarını kopyala
+                        safe_copy_tree(src_conv_dir, target_conv, skip_existing=True)
+                    src_sum_db = os.path.join(item["full_path"], "conversation_summaries.db")
+                    if os.path.exists(src_sum_db):
+                        self._update_imp_status("Konuşma veritabanları SQLite ile birleştiriliyor...")
+                        merge_info = merge_conversation_summaries_db(src_sum_db, target_summaries_db)
                 elif itype in ("scratch_project", "custom_project"):
                     folder_name = item.get("folder_name", os.path.basename(item["full_path"]))
                     target_project_dir = os.path.join(target_scratch, folder_name)
@@ -933,7 +1142,7 @@ class AntigravityMigratorApp(tk.Tk):
                     target_project_dir = os.path.join(target_scratch, folder_name)
                     safe_copy_tree(item["full_path"], target_project_dir)
 
-            self.after(0, lambda: self._on_import_success(dest_gemini, len(selected_items)))
+            self.after(0, lambda: self._on_import_success(dest_gemini, len(selected_items), merge_info))
 
         except Exception as e:
             self.after(0, lambda: self._on_import_error(str(e)))
@@ -941,16 +1150,22 @@ class AntigravityMigratorApp(tk.Tk):
     def _update_imp_status(self, text):
         self.after(0, lambda: self.imp_status_lbl.config(text=text))
 
-    def _on_import_success(self, dest_gemini, count):
+    def _on_import_success(self, dest_gemini, count, merge_info=None):
         self.imp_progress.stop()
         self.imp_progress.config(mode="determinate", value=100)
         self.btn_start_import.config(state="normal")
         self.imp_status_lbl.config(text="✅ İçe aktarma başarıyla tamamlandı!")
-        
+
+        merge_msg = ""
+        if merge_info is not None:
+            added, total = merge_info
+            merge_msg = f"\n\n💬 Konuşma Veritabanı Birleştirme:\n• Yeni eklenen konuşma: {added}\n• Toplam konuşma sayısı: {total}"
+
         msg = (
             f"Harika! Seçtiğiniz {count} öğe başarıyla bu bilgisayara aktarıldı.\n\n"
-            f"Hedef Dizin: {dest_gemini}\n\n"
-            f"Artık Antigravity'yi başlatıp çalışmalarınıza kaldığınız yerden devam edebilirsiniz!"
+            f"Hedef Dizin: {dest_gemini}"
+            f"{merge_msg}\n\n"
+            f"Artık Antigravity'yi başlatıp tüm eski ve yeni konuşmalarınızla çalışmalarınıza devam edebilirsiniz!"
         )
         messagebox.showinfo("İçe Aktarma Tamamlandı", msg)
 
@@ -989,6 +1204,7 @@ class AntigravityMigratorApp(tk.Tk):
                 self.scan_import_items()
         else:
             self.scan_export_items()
+
 
 if __name__ == "__main__":
     app = AntigravityMigratorApp()

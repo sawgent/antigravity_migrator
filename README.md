@@ -25,8 +25,11 @@ Birçok kullanıcı yeni bilgisayara geçerken `C:\Users\<Kullanıcı>\.gemini` 
 
 - **📁 Gruplanmış ve Net Arayüz:**
   - **Projeler:** Scratch klasöründeki projeler, bağımsız scriptler ve kullanıcının eklediği özel proje klasörleri ayrı bir grup olarak listelenir.
-  - **Sistem & Yapılandırma:** Eklentiler (plugins), özel beceriler (skills), kurallar (rules), MCP yapılandırmaları ve konuşma geçmişi (brain) ayrı bir grupta toplanır.
+  - **Sistem & Yapılandırma:** Eklentiler (plugins), özel beceriler (skills), kurallar (rules), MCP yapılandırmaları, **konuşma veritabanları (`conversations/*.db` + `conversation_summaries.db`)**, **bilgi tabanı (`knowledge`)**, **notlar (`annotations`)** ve üretilen dokümanlar (`brain`) ayrı bir grupta toplanır.
   - Her grup için bağımsız *"Tümünü Seç / Kaldır"* kontrolü.
+- **🔄 Akıllı SQLite Konuşma Birleştirme (Kayıpsız Merge):**
+  - Yeni bilgisayarda halihazırda yeni konuşmalarınız varsa, eski `conversation_summaries.db` dosyasını üzerine yazıp mevcut konuşmaları silmek yerine; iki SQLite veritabanını (`conversation_summaries`, `conversation_parents` ve FTS5 arama indeksi `conversations_fts`) otomatik olarak birleştirir.
+  - Yedekleme sırasında SQLite `backup()` API'si kullanarak `.db-wal` bekleyen yazmalarını temiz tekil `.db` dosyasına aktarır.
 - **🔍 Akıllı Yedek Algılama (Auto-Detection):**
   - Program yedek klasörünün içerisine kendisinin de bir kopyasını koyar.
   - Klasörü yeni bilgisayara taşıyıp içindeki programı çalıştırdığınızda yanı başındaki yedekleri otomatik algılar ve *"Yedekleri bu bilgisayara aktarayım mı?"* diye sorar.
